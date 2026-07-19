@@ -2,15 +2,23 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+/// Token id / KV cache index 的基础整数类型。
+///
+/// 为了贴近 mini-sglang 里 `torch.int32` token/index tensor 的语义，这里统一用 `i32`。
 pub type Token = i32;
 type NodeId = usize;
 type ChildKey = Vec<Token>;
 
 const ROOT: NodeId = 0;
 
+/// 当前 prefix cache 的容量统计。
+///
+/// 这里的 size 单位是 token/index 个数，而不是节点数或 page 数。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SizeInfo {
+    /// 可以被 evict 的 token 数量：所有 `ref_count == 0` 的可达非 root 节点长度之和。
     pub evictable_size: usize,
+    /// 正在被 handle lock 保护、不能 evict 的 token 数量。
     pub protected_size: usize,
 }
 
@@ -22,7 +30,9 @@ impl SizeInfo {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RadixCacheHandle {
+    /// 从 root 到 `node` 这条路径上已经命中的 prefix 长度。
     pub cached_len: usize,
+    /// handle 指向的 radix tree 节点。节点 id 不对外暴露可变访问。
     node: NodeId,
 }
 
@@ -47,13 +57,21 @@ pub struct InsertResult {
 
 #[derive(Debug, Clone)]
 struct RadixTreeNode {
+    /// 该压缩边保存的 token 片段。
     key: Vec<Token>,
+    /// 与 `key` 一一对应的 KV cache index 片段。
     value: Vec<Token>,
+    /// 子节点索引。key 是子节点 `key` 的第一个 page，因此查找可以按 page 前缀跳转。
     children: HashMap<ChildKey, NodeId>,
+    /// 父节点 id；root 没有父节点。
     parent: Option<NodeId>,
+    /// 被多少个 active handle 保护。为 0 的 leaf 才允许被 evict。
     ref_count: usize,
+    /// 稳定 id，用于 LRU heap 里 timestamp 相同时做 deterministic tie-break。
     uuid: usize,
+    /// 访问时间戳，用于 leaf LRU eviction。
     timestamp: u64,
+    /// 节点被 evict 后不会从 `nodes` Vec 里物理删除，只标记为 dead，避免 NodeId 失效。
     alive: bool,
 }
 
@@ -144,6 +162,9 @@ pub struct RadixPrefixCache {
 }
 
 impl RadixPrefixCache {
+    /// 创建一个空的 radix prefix cache。
+    ///
+    /// `page_size` 决定插入和匹配时的对齐粒度。所有插入长度都会向下对齐到 page 边界。
     pub fn new(page_size: usize) -> Self {
         assert!(page_size > 0, "page_size must be positive");
         Self {
@@ -166,6 +187,10 @@ impl RadixPrefixCache {
         }
     }
 
+    /// 查找 `input_ids` 在 radix tree 里的最长已缓存前缀。
+    ///
+    /// 注意：这个方法不是纯读操作。它会更新 LRU timestamp，并且当查询在某个压缩边中间
+    /// 停止匹配时，会 split 该节点。因此并发包装器里也必须把它放在互斥锁下执行。
     pub fn match_prefix(&mut self, input_ids: &[Token]) -> MatchResult {
         let (node, prefix_len) = self.tree_walk(input_ids);
         MatchResult {
@@ -176,12 +201,17 @@ impl RadixPrefixCache {
         }
     }
 
+    /// 插入一个 prefix 及其对应的 KV cache indices。
+    ///
+    /// 返回值里的 `cached_len` 表示插入前已经存在的前缀长度；调用方如果管理外部 cache
+    /// page，可以据此释放重复写入的部分。
     pub fn insert_prefix(&mut self, input_ids: &[Token], indices: &[Token]) -> InsertResult {
         assert_eq!(
             input_ids.len(),
             indices.len(),
             "input_ids/indices lengths must match"
         );
+        // 只缓存完整 page，未对齐的尾部 token 不进入 prefix cache。
         let insert_len = align_down(input_ids.len(), self.page_size);
         let input_ids = &input_ids[..insert_len];
         let indices = &indices[..insert_len];
@@ -206,6 +236,10 @@ impl RadixPrefixCache {
         }
     }
 
+    /// 锁定一个 handle 对应路径，防止其已匹配节点被 eviction 删除。
+    ///
+    /// 锁定操作沿着 handle 节点一直向上更新 ref_count；当节点从 0 变为 1 时，
+    /// 该节点从 evictable 区转入 protected 区。
     pub fn lock_handle(&mut self, handle: RadixCacheHandle) {
         let mut node = handle.node;
         while node != ROOT {
@@ -220,6 +254,9 @@ impl RadixPrefixCache {
         }
     }
 
+    /// 释放一个之前锁定过的 handle。
+    ///
+    /// 当节点 ref_count 从 1 降为 0 时，它重新变为 evictable。
     pub fn unlock_handle(&mut self, handle: RadixCacheHandle) {
         let mut node = handle.node;
         while node != ROOT {
@@ -238,6 +275,10 @@ impl RadixPrefixCache {
         }
     }
 
+    /// 根据 handle 回溯到 root，拼接完整命中前缀对应的 KV cache indices。
+    ///
+    /// 调用方应保证 handle 在使用期间没有被 evict；并发场景下建议在 `with_cache` 里
+    /// 完成 `match -> lock -> get -> unlock` 的原子序列。
     pub fn get_matched_indices(&self, handle: RadixCacheHandle) -> Vec<Token> {
         let mut node = handle.node;
         let mut parts: Vec<&[Token]> = Vec::new();
@@ -257,6 +298,10 @@ impl RadixPrefixCache {
         result
     }
 
+    /// 从未被锁定的 leaf 节点中按 LRU 顺序驱逐至少 `size` 个 token。
+    ///
+    /// 返回被驱逐的 KV cache indices。由于 radix tree 以节点为粒度删除，实际驱逐长度
+    /// 可能大于请求的 `size`。
     pub fn evict(&mut self, size: usize) -> Vec<Token> {
         if size == 0 {
             return Vec::new();
@@ -360,6 +405,10 @@ impl RadixPrefixCache {
         node
     }
 
+    /// 沿 radix tree 查找最长 prefix。
+    ///
+    /// 返回 `(最后命中的节点, 命中的 token 长度)`。如果查询只匹配到某个压缩边的一部分，
+    /// 会在 page 边界处 split 该边，让返回的节点正好代表已命中的 prefix。
     fn tree_walk(&mut self, input_ids: &[Token]) -> (NodeId, usize) {
         let mut prefix_len = 0;
         let total_len = input_ids.len();
@@ -384,12 +433,19 @@ impl RadixPrefixCache {
                 return (split_node, prefix_len);
             }
 
+            // 完整经过该节点时刷新 timestamp，作为 LRU eviction 的最近访问依据。
             self.nodes[node].timestamp = tic;
         }
 
         (node, prefix_len)
     }
 
+    /// 将一个压缩边节点在 `pos` 处拆成父子两个节点。
+    ///
+    /// split 后：
+    /// - 新节点保存原 key/value 的前半段，并接到原 parent 下；
+    /// - 原节点保存后半段，并成为新节点的 child；
+    /// - 原节点的 children 不变，因为它们仍属于后半段 prefix。
     fn split_at(&mut self, node: NodeId, pos: usize, timestamp: u64) -> NodeId {
         assert!(
             pos > 0 && pos < self.nodes[node].len(),
@@ -429,6 +485,9 @@ impl RadixPrefixCache {
         new_parent_id
     }
 
+    /// 生成 children map 的索引 key。
+    ///
+    /// 正常情况下取一个完整 page；如果查询剩余长度小于 page_size，则使用剩余 token。
     fn child_key(&self, tokens: &[Token]) -> ChildKey {
         assert!(!tokens.is_empty(), "child key requires at least one token");
         tokens[..tokens.len().min(self.page_size)].to_vec()
@@ -447,6 +506,7 @@ impl RadixPrefixCache {
             && self.nodes[node].is_leaf()
     }
 
+    /// 收集当前可驱逐的 leaf 节点，并放入按 timestamp 排序的最小堆语义结构。
     fn collect_leaf_nodes_for_evict(&self, heap: &mut BinaryHeap<EvictCandidate>) {
         let mut stack = vec![ROOT];
         while let Some(node) = stack.pop() {
@@ -464,6 +524,7 @@ impl RadixPrefixCache {
         }
     }
 
+    /// 递归校验 radix tree 不变量，用于测试和调试。
     fn check_node(
         &self,
         node: NodeId,
@@ -526,28 +587,37 @@ pub struct ConcurrentRadixPrefixCache {
 }
 
 impl ConcurrentRadixPrefixCache {
+    /// 创建一个粗粒度互斥的并发 wrapper。
     pub fn new(page_size: usize) -> Self {
         Self {
             inner: Mutex::new(RadixPrefixCache::new(page_size)),
         }
     }
 
+    /// 直接返回 `Arc` 包装后的共享 cache，方便跨线程 clone 和传递。
     pub fn shared(page_size: usize) -> SharedRadixPrefixCache {
         Arc::new(Self::new(page_size))
     }
 
+    /// 将一个已有的单线程 cache 转换成并发安全 wrapper。
     pub fn from_cache(cache: RadixPrefixCache) -> Self {
         Self {
             inner: Mutex::new(cache),
         }
     }
 
+    /// 获取底层 cache 的互斥 guard。
+    ///
+    /// 当调用方需要执行一组不可被其他线程插入的多步操作时使用该方法。
     pub fn lock(&self) -> MutexGuard<'_, RadixPrefixCache> {
         self.inner
             .lock()
             .expect("radix prefix cache mutex poisoned")
     }
 
+    /// 在同一把锁下执行闭包。
+    ///
+    /// 这是推荐的多步原子操作入口，例如 `match -> lock_handle -> get_indices`。
     pub fn with_cache<R>(&self, f: impl FnOnce(&mut RadixPrefixCache) -> R) -> R {
         let mut cache = self.lock();
         f(&mut cache)
