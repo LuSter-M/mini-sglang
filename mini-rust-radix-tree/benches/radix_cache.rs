@@ -1,7 +1,7 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use mini_rust_radix_tree::RadixPrefixCache;
+use mini_rust_radix_tree::{ConcurrentRadixPrefixCache, RadixPrefixCache};
 
 const WARMUP_ITERS: usize = 100;
 const BENCH_ITERS: usize = 1_000;
@@ -143,6 +143,36 @@ fn bench_lock_unlock() {
     });
 }
 
+fn bench_concurrent_wrapper() {
+    let mut raw_cache = build_linear_cache(1_024, 128, 1);
+    let wrapped_cache = ConcurrentRadixPrefixCache::from_cache(raw_cache.clone());
+    let query = sequential_tokens(512 * 128, 160);
+
+    time_case("mutex_wrapper/match_prefix_raw", BENCH_ITERS * 10, || {
+        black_box(raw_cache.match_prefix(black_box(&query)));
+    });
+
+    time_case(
+        "mutex_wrapper/match_prefix_serialized",
+        BENCH_ITERS * 10,
+        || {
+            black_box(wrapped_cache.match_prefix(black_box(&query)));
+        },
+    );
+
+    let cache = ConcurrentRadixPrefixCache::new(1);
+    let input_ids = sequential_tokens(0, 128);
+    let indices = cache_indices(0, 128);
+    time_case(
+        "mutex_wrapper/insert_prefix_serialized",
+        BENCH_ITERS,
+        || {
+            cache.reset();
+            black_box(cache.insert_prefix(black_box(&input_ids), black_box(&indices)));
+        },
+    );
+}
+
 fn bench_evict() {
     for &(num_prefixes, prefix_len, page_size, evict_size) in
         &[(1_024, 64, 1, 4096), (1_024, 1024, 16, 16_384)]
@@ -167,5 +197,6 @@ fn main() {
     bench_match();
     bench_split();
     bench_lock_unlock();
+    bench_concurrent_wrapper();
     bench_evict();
 }

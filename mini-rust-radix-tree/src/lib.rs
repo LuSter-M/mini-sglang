@@ -1,7 +1,8 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-type Token = i32;
+pub type Token = i32;
 type NodeId = usize;
 type ChildKey = Vec<Token>;
 
@@ -506,6 +507,97 @@ impl RadixPrefixCache {
     }
 }
 
+pub type SharedRadixPrefixCache = Arc<ConcurrentRadixPrefixCache>;
+
+/// A coarse-grained concurrent wrapper around [`RadixPrefixCache`].
+///
+/// This is intentionally a single `Mutex` around the full tree. It matches the
+/// current "single-threaded scheduler / external mutex serialization" model:
+/// every operation is serialized, so callers can safely share the cache across
+/// threads with `Arc<ConcurrentRadixPrefixCache>` without introducing data races.
+///
+/// For multi-step sequences that must be atomic, such as `match_prefix ->
+/// lock_handle -> get_matched_indices`, prefer [`ConcurrentRadixPrefixCache::lock`]
+/// or [`ConcurrentRadixPrefixCache::with_cache`] and perform the sequence while
+/// holding the guard.
+#[derive(Debug)]
+pub struct ConcurrentRadixPrefixCache {
+    inner: Mutex<RadixPrefixCache>,
+}
+
+impl ConcurrentRadixPrefixCache {
+    pub fn new(page_size: usize) -> Self {
+        Self {
+            inner: Mutex::new(RadixPrefixCache::new(page_size)),
+        }
+    }
+
+    pub fn shared(page_size: usize) -> SharedRadixPrefixCache {
+        Arc::new(Self::new(page_size))
+    }
+
+    pub fn from_cache(cache: RadixPrefixCache) -> Self {
+        Self {
+            inner: Mutex::new(cache),
+        }
+    }
+
+    pub fn lock(&self) -> MutexGuard<'_, RadixPrefixCache> {
+        self.inner
+            .lock()
+            .expect("radix prefix cache mutex poisoned")
+    }
+
+    pub fn with_cache<R>(&self, f: impl FnOnce(&mut RadixPrefixCache) -> R) -> R {
+        let mut cache = self.lock();
+        f(&mut cache)
+    }
+
+    pub fn page_size(&self) -> usize {
+        self.with_cache(|cache| cache.page_size())
+    }
+
+    pub fn size_info(&self) -> SizeInfo {
+        self.with_cache(|cache| cache.size_info())
+    }
+
+    pub fn match_prefix(&self, input_ids: &[Token]) -> MatchResult {
+        self.with_cache(|cache| cache.match_prefix(input_ids))
+    }
+
+    pub fn insert_prefix(&self, input_ids: &[Token], indices: &[Token]) -> InsertResult {
+        self.with_cache(|cache| cache.insert_prefix(input_ids, indices))
+    }
+
+    pub fn lock_handle(&self, handle: RadixCacheHandle) {
+        self.with_cache(|cache| cache.lock_handle(handle));
+    }
+
+    pub fn unlock_handle(&self, handle: RadixCacheHandle) {
+        self.with_cache(|cache| cache.unlock_handle(handle));
+    }
+
+    pub fn get_matched_indices(&self, handle: RadixCacheHandle) -> Vec<Token> {
+        self.with_cache(|cache| cache.get_matched_indices(handle))
+    }
+
+    pub fn evict(&self, size: usize) -> Vec<Token> {
+        self.with_cache(|cache| cache.evict(size))
+    }
+
+    pub fn reset(&self) {
+        self.with_cache(|cache| cache.reset());
+    }
+
+    pub fn check_integrity(&self) -> Result<(), String> {
+        self.with_cache(|cache| cache.check_integrity())
+    }
+
+    pub fn debug_dump(&self) -> Vec<(usize, Option<usize>, Vec<Token>, Vec<Token>, usize)> {
+        self.with_cache(|cache| cache.debug_dump())
+    }
+}
+
 fn align_down(value: usize, alignment: usize) -> usize {
     value / alignment * alignment
 }
@@ -520,6 +612,9 @@ fn common_prefix_len(lhs: &[Token], rhs: &[Token]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
+
+    fn assert_send_sync<T: Send + Sync>() {}
 
     #[test]
     fn insert_and_match_full_prefix_page_size_one() {
@@ -659,6 +754,62 @@ mod tests {
 
         assert_eq!(cache.size_info().total_size(), 0);
         assert_eq!(cache.match_prefix(&[1, 2]).handle.cached_len, 0);
+        cache.check_integrity().unwrap();
+    }
+
+    #[test]
+    fn concurrent_wrapper_is_send_and_sync() {
+        assert_send_sync::<ConcurrentRadixPrefixCache>();
+        assert_send_sync::<SharedRadixPrefixCache>();
+    }
+
+    #[test]
+    fn concurrent_wrapper_serializes_parallel_inserts() {
+        let cache = ConcurrentRadixPrefixCache::shared(1);
+        let mut workers = Vec::new();
+
+        for worker_id in 0..8 {
+            let cache = Arc::clone(&cache);
+            workers.push(thread::spawn(move || {
+                for local_id in 0..128 {
+                    let base = worker_id * 10_000 + local_id * 4;
+                    let input_ids = vec![base, base + 1, base + 2, base + 3];
+                    let indices = vec![base * 10, base * 10 + 1, base * 10 + 2, base * 10 + 3];
+                    cache.insert_prefix(&input_ids, &indices);
+                }
+            }));
+        }
+
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        assert_eq!(cache.size_info().total_size(), 8 * 128 * 4);
+        cache.check_integrity().unwrap();
+
+        let matched = cache.match_prefix(&[20_000, 20_001, 20_002, 20_003, 42]);
+        assert_eq!(matched.handle.cached_len, 4);
+        assert_eq!(
+            cache.get_matched_indices(matched.handle),
+            vec![200_000, 200_001, 200_002, 200_003]
+        );
+    }
+
+    #[test]
+    fn concurrent_wrapper_supports_atomic_multi_step_with_guard() {
+        let cache = ConcurrentRadixPrefixCache::shared(1);
+        cache.insert_prefix(&[1, 2, 3], &[10, 11, 12]);
+
+        let indices = cache.with_cache(|cache| {
+            let matched = cache.match_prefix(&[1, 2, 3, 4]);
+            cache.lock_handle(matched.handle);
+            let indices = cache.get_matched_indices(matched.handle);
+            cache.unlock_handle(matched.handle);
+            indices
+        });
+
+        assert_eq!(indices, vec![10, 11, 12]);
+        assert_eq!(cache.size_info().evictable_size, 3);
         cache.check_integrity().unwrap();
     }
 }
