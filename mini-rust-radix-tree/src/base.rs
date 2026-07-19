@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::sync::Arc;
 
 /// Token id / KV cache index 的基础整数类型。
 ///
@@ -63,11 +64,70 @@ pub struct InsertResult {
 }
 
 #[derive(Debug, Clone)]
+struct TokenSpan {
+    data: Arc<[Token]>,
+    start: usize,
+    len: usize,
+}
+
+impl TokenSpan {
+    fn empty() -> Self {
+        Self {
+            data: Arc::from([]),
+            start: 0,
+            len: 0,
+        }
+    }
+
+    fn from_slice(tokens: &[Token]) -> Self {
+        Self {
+            data: Arc::from(tokens),
+            start: 0,
+            len: tokens.len(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn as_slice(&self) -> &[Token] {
+        &self.data[self.start..self.start + self.len]
+    }
+
+    fn prefix(&self, len: usize) -> Self {
+        assert!(len <= self.len, "prefix length out of range");
+        Self {
+            data: Arc::clone(&self.data),
+            start: self.start,
+            len,
+        }
+    }
+
+    fn suffix_from(&self, offset: usize) -> Self {
+        assert!(offset <= self.len, "suffix offset out of range");
+        Self {
+            data: Arc::clone(&self.data),
+            start: self.start + offset,
+            len: self.len - offset,
+        }
+    }
+
+    fn to_vec(&self) -> Vec<Token> {
+        self.as_slice().to_vec()
+    }
+}
+
+#[derive(Debug, Clone)]
 struct RadixTreeNode {
     /// 该压缩边保存的 token 片段。
-    key: Vec<Token>,
+    key: TokenSpan,
     /// 与 `key` 一一对应的 KV cache index 片段。
-    value: Vec<Token>,
+    value: TokenSpan,
     /// 子节点索引。key 是子节点 `key` 的第一个 page，因此查找可以按 page 前缀跳转。
     children: HashMap<ChildKey, NodeId>,
     /// 父节点 id；root 没有父节点。
@@ -85,8 +145,8 @@ struct RadixTreeNode {
 impl RadixTreeNode {
     fn new_root(timestamp: u64) -> Self {
         Self {
-            key: Vec::new(),
-            value: Vec::new(),
+            key: TokenSpan::empty(),
+            value: TokenSpan::empty(),
             children: HashMap::new(),
             parent: None,
             ref_count: 1,
@@ -96,13 +156,7 @@ impl RadixTreeNode {
         }
     }
 
-    fn new(
-        key: Vec<Token>,
-        value: Vec<Token>,
-        parent: NodeId,
-        uuid: usize,
-        timestamp: u64,
-    ) -> Self {
+    fn new(key: TokenSpan, value: TokenSpan, parent: NodeId, uuid: usize, timestamp: u64) -> Self {
         assert_eq!(key.len(), value.len(), "key/value lengths must match");
         assert!(
             !key.is_empty(),
@@ -263,11 +317,7 @@ impl RadixPrefixCache {
 
         let (mut node, prefix_len) = self.tree_walk(input_ids);
         if prefix_len != insert_len {
-            let new_node = self.add_child(
-                node,
-                input_ids[prefix_len..].to_vec(),
-                indices[prefix_len..].to_vec(),
-            );
+            let new_node = self.add_child(node, &input_ids[prefix_len..], &indices[prefix_len..]);
             self.evictable_size += self.nodes[new_node].len();
             node = new_node;
         }
@@ -372,13 +422,13 @@ impl RadixPrefixCache {
             }
 
             evicted_size += self.nodes[node].len();
-            evicted_indices.extend_from_slice(&self.nodes[node].value);
+            evicted_indices.extend_from_slice(self.nodes[node].value.as_slice());
             self.evictable_size -= self.nodes[node].len();
 
             let parent = self.nodes[node]
                 .parent
                 .expect("evicted node must not be root");
-            let child_key = self.child_key_owned(&self.nodes[node].key);
+            let child_key = self.child_key_owned(self.nodes[node].key.as_slice());
             self.nodes[parent].children.remove(&child_key);
             self.nodes[node].alive = false;
 
@@ -425,20 +475,25 @@ impl RadixPrefixCache {
                 (
                     n.uuid,
                     n.parent,
-                    n.key.clone(),
-                    n.value.clone(),
+                    n.key.to_vec(),
+                    n.value.to_vec(),
                     n.ref_count,
                 )
             })
             .collect()
     }
 
-    fn add_child(&mut self, parent: NodeId, key: Vec<Token>, value: Vec<Token>) -> NodeId {
-        let child_key = self.child_key_owned(&key);
+    fn add_child(&mut self, parent: NodeId, key: &[Token], value: &[Token]) -> NodeId {
+        let child_key = self.child_key_owned(key);
         let node = self.nodes.len();
         let timestamp = self.tick();
-        self.nodes
-            .push(RadixTreeNode::new(key, value, parent, node, timestamp));
+        self.nodes.push(RadixTreeNode::new(
+            TokenSpan::from_slice(key),
+            TokenSpan::from_slice(value),
+            parent,
+            node,
+            timestamp,
+        ));
         let replaced = self.nodes[parent].children.insert(child_key, node);
         assert!(
             replaced.is_none(),
@@ -465,7 +520,7 @@ impl RadixPrefixCache {
             node = child;
 
             let match_len = align_down(
-                common_prefix_len(&self.nodes[node].key, &input_ids[prefix_len..]),
+                common_prefix_len(self.nodes[node].key.as_slice(), &input_ids[prefix_len..]),
                 self.page_size,
             );
             prefix_len += match_len;
@@ -499,7 +554,7 @@ impl RadixPrefixCache {
             node = child;
 
             let match_len = align_down(
-                common_prefix_len(&self.nodes[node].key, &input_ids[prefix_len..]),
+                common_prefix_len(self.nodes[node].key.as_slice(), &input_ids[prefix_len..]),
                 self.page_size,
             );
             prefix_len += match_len;
@@ -526,14 +581,12 @@ impl RadixPrefixCache {
         let parent = self.nodes[node].parent.expect("cannot split root");
 
         let old_ref_count = self.nodes[node].ref_count;
-        let old_child_key = self.child_key_owned(&self.nodes[node].key);
+        let old_child_key = self.child_key_owned(self.nodes[node].key.as_slice());
 
-        // `split_off` 只为后半段分配新 buffer；前半段复用原 Vec 的 allocation。
-        // 相比先 clone 整个 key/value 再分别 to_vec，可少一次完整边长度的 clone。
-        let tail_key = self.nodes[node].key.split_off(pos);
-        let tail_value = self.nodes[node].value.split_off(pos);
-        let prefix_key = std::mem::replace(&mut self.nodes[node].key, tail_key);
-        let prefix_value = std::mem::replace(&mut self.nodes[node].value, tail_value);
+        let prefix_key = self.nodes[node].key.prefix(pos);
+        let prefix_value = self.nodes[node].value.prefix(pos);
+        self.nodes[node].key = self.nodes[node].key.suffix_from(pos);
+        self.nodes[node].value = self.nodes[node].value.suffix_from(pos);
 
         let new_parent_id = self.nodes.len();
         let mut new_parent =
@@ -547,7 +600,7 @@ impl RadixPrefixCache {
 
         self.nodes[node].parent = Some(new_parent_id);
 
-        let new_child_key = self.child_key_owned(&self.nodes[node].key);
+        let new_child_key = self.child_key_owned(self.nodes[node].key.as_slice());
         self.nodes[new_parent_id]
             .children
             .insert(new_child_key, node);
@@ -592,7 +645,7 @@ impl RadixPrefixCache {
         let n = &self.nodes[node];
         assert!(n.alive, "handle points to an evicted node");
         let take = remaining.min(n.value.len());
-        output.extend_from_slice(&n.value[..take]);
+        output.extend_from_slice(&n.value.as_slice()[..take]);
         remaining - take
     }
 
@@ -661,7 +714,7 @@ impl RadixPrefixCache {
             if self.nodes[*child].parent != Some(node) {
                 return Err(format!("child {child} parent mismatch"));
             }
-            let expected_key = self.child_key_slice(&self.nodes[*child].key);
+            let expected_key = self.child_key_slice(self.nodes[*child].key.as_slice());
             if key.as_slice() != expected_key {
                 return Err(format!("child map key mismatch for child {child}"));
             }
