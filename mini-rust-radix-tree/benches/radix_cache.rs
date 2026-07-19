@@ -1,10 +1,16 @@
 use std::hint::black_box;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use mini_rust_radix_tree::{ConcurrentRadixPrefixCache, RadixPrefixCache};
 
 const WARMUP_ITERS: usize = 100;
-const BENCH_ITERS: usize = 1_000;
+const BENCH_ITERS: usize = 10_000;
+const FAST_BENCH_ITERS: usize = 1_000_000;
+const EVICT_BENCH_ITERS: usize = 1_000;
+const PARALLEL_THREADS: usize = 8;
+const PARALLEL_LOOKUP_ITERS_PER_THREAD: usize = 100_000;
+const PARALLEL_MATCH_ITERS_PER_THREAD: usize = 20_000;
 
 fn sequential_tokens(start: i32, len: usize) -> Vec<i32> {
     (0..len).map(|i| start + i as i32).collect()
@@ -82,8 +88,79 @@ fn print_result(name: &str, iters: usize, elapsed: Duration) {
     );
 }
 
+fn time_parallel_case<F>(name: &str, threads: usize, iters_per_thread: usize, f: F)
+where
+    F: Fn(usize, usize) + Sync,
+{
+    thread::scope(|scope| {
+        for worker_id in 0..threads {
+            let f = &f;
+            scope.spawn(move || {
+                for iter in 0..WARMUP_ITERS {
+                    f(worker_id, iter);
+                }
+            });
+        }
+    });
+
+    let start = Instant::now();
+    thread::scope(|scope| {
+        for worker_id in 0..threads {
+            let f = &f;
+            scope.spawn(move || {
+                for iter in 0..iters_per_thread {
+                    f(worker_id, iter);
+                }
+            });
+        }
+    });
+    let elapsed = start.elapsed();
+    print_result(name, threads * iters_per_thread, elapsed);
+}
+
+fn time_parallel_case_with_state<S, I, F>(
+    name: &str,
+    threads: usize,
+    iters_per_thread: usize,
+    init: I,
+    f: F,
+) where
+    S: Send,
+    I: Fn() -> S + Sync,
+    F: Fn(usize, usize, &mut S) + Sync,
+{
+    thread::scope(|scope| {
+        for worker_id in 0..threads {
+            let init = &init;
+            let f = &f;
+            scope.spawn(move || {
+                let mut state = init();
+                for iter in 0..WARMUP_ITERS {
+                    f(worker_id, iter, &mut state);
+                }
+            });
+        }
+    });
+
+    let start = Instant::now();
+    thread::scope(|scope| {
+        for worker_id in 0..threads {
+            let init = &init;
+            let f = &f;
+            scope.spawn(move || {
+                let mut state = init();
+                for iter in 0..iters_per_thread {
+                    f(worker_id, iter, &mut state);
+                }
+            });
+        }
+    });
+    let elapsed = start.elapsed();
+    print_result(name, threads * iters_per_thread, elapsed);
+}
+
 fn bench_insert() {
-    for &(prefix_len, page_size) in &[(128, 1), (1024, 1), (1024, 16)] {
+    for &(prefix_len, page_size) in &[(128, 1), (1024, 1), (1024, 16), (4096, 16)] {
         let input_ids = sequential_tokens(0, prefix_len);
         let indices = cache_indices(0, prefix_len);
         time_case(
@@ -98,9 +175,13 @@ fn bench_insert() {
 }
 
 fn bench_match() {
-    for &(num_prefixes, prefix_len, page_size) in
-        &[(1_024, 128, 1), (1_024, 1024, 1), (1_024, 1024, 16)]
-    {
+    for &(num_prefixes, prefix_len, page_size) in &[
+        (1_024, 128, 1),
+        (1_024, 1024, 1),
+        (1_024, 1024, 16),
+        (4_096, 1024, 16),
+        (8_192, 512, 16),
+    ] {
         let mut cache = build_linear_cache(num_prefixes, prefix_len, page_size);
         let query = sequential_tokens(((num_prefixes / 2) * prefix_len) as i32, prefix_len + 32);
         time_case(
@@ -108,6 +189,38 @@ fn bench_match() {
             BENCH_ITERS * 10,
             || {
                 black_box(cache.match_prefix(black_box(&query)));
+            },
+        );
+    }
+}
+
+fn bench_lookup() {
+    for &(num_prefixes, prefix_len, page_size) in &[
+        (1_024, 128, 1),
+        (1_024, 1024, 1),
+        (1_024, 1024, 16),
+        (4_096, 1024, 16),
+        (8_192, 512, 16),
+    ] {
+        let cache = build_linear_cache(num_prefixes, prefix_len, page_size);
+        let query = sequential_tokens(((num_prefixes / 2) * prefix_len) as i32, prefix_len + 32);
+        time_case(
+            &format!("lookup_indices/prefixes_{num_prefixes}_len_{prefix_len}_page_{page_size}"),
+            BENCH_ITERS * 10,
+            || {
+                black_box(cache.lookup_indices(black_box(&query)));
+            },
+        );
+
+        let mut output = Vec::with_capacity(prefix_len);
+        time_case(
+            &format!(
+                "lookup_indices_into/prefixes_{num_prefixes}_len_{prefix_len}_page_{page_size}"
+            ),
+            BENCH_ITERS * 10,
+            || {
+                black_box(cache.lookup_indices_into(black_box(&query), black_box(&mut output)));
+                black_box(&output);
             },
         );
     }
@@ -153,10 +266,51 @@ fn bench_concurrent_wrapper() {
     });
 
     time_case(
-        "mutex_wrapper/match_prefix_serialized",
-        BENCH_ITERS * 10,
+        "rwlock_wrapper/match_prefix_write_locked",
+        FAST_BENCH_ITERS,
         || {
             black_box(wrapped_cache.match_prefix(black_box(&query)));
+        },
+    );
+
+    time_case(
+        "rwlock_wrapper/lookup_indices_raw",
+        FAST_BENCH_ITERS,
+        || {
+            black_box(raw_cache.lookup_indices(black_box(&query)));
+        },
+    );
+
+    time_case(
+        "rwlock_wrapper/lookup_indices_read_locked",
+        FAST_BENCH_ITERS,
+        || {
+            black_box(wrapped_cache.lookup_indices(black_box(&query)));
+        },
+    );
+
+    let mut raw_lookup_output = Vec::with_capacity(128);
+    time_case(
+        "rwlock_wrapper/lookup_indices_into_raw",
+        FAST_BENCH_ITERS,
+        || {
+            black_box(
+                raw_cache.lookup_indices_into(black_box(&query), black_box(&mut raw_lookup_output)),
+            );
+            black_box(&raw_lookup_output);
+        },
+    );
+
+    let mut locked_lookup_output = Vec::with_capacity(128);
+    time_case(
+        "rwlock_wrapper/lookup_indices_into_read_locked",
+        FAST_BENCH_ITERS,
+        || {
+            black_box(
+                wrapped_cache
+                    .lookup_indices_into(black_box(&query), black_box(&mut locked_lookup_output)),
+            );
+            black_box(&locked_lookup_output);
         },
     );
 
@@ -164,11 +318,61 @@ fn bench_concurrent_wrapper() {
     let input_ids = sequential_tokens(0, 128);
     let indices = cache_indices(0, 128);
     time_case(
-        "mutex_wrapper/insert_prefix_serialized",
-        BENCH_ITERS,
+        "rwlock_wrapper/reset_insert_two_write_locks",
+        FAST_BENCH_ITERS,
         || {
             cache.reset();
             black_box(cache.insert_prefix(black_box(&input_ids), black_box(&indices)));
+        },
+    );
+
+    time_case(
+        "rwlock_wrapper/reset_insert_one_write_lock",
+        FAST_BENCH_ITERS,
+        || {
+            cache.with_write_cache(|cache| {
+                cache.reset();
+                black_box(cache.insert_prefix(black_box(&input_ids), black_box(&indices)));
+            });
+        },
+    );
+
+    let parallel_cache = ConcurrentRadixPrefixCache::from_cache(build_linear_cache(4_096, 128, 1));
+    let parallel_queries: Vec<_> = (0..4_096)
+        .map(|prefix_id| sequential_tokens(prefix_id * 128, 160))
+        .collect();
+    time_parallel_case(
+        &format!("rwlock_wrapper/parallel_lookup_indices_{PARALLEL_THREADS}_threads"),
+        PARALLEL_THREADS,
+        PARALLEL_LOOKUP_ITERS_PER_THREAD,
+        |worker_id, iter| {
+            let prefix_id = (worker_id * 257 + iter) % 4_096;
+            let query = &parallel_queries[prefix_id];
+            black_box(parallel_cache.lookup_indices(black_box(&query)));
+        },
+    );
+
+    time_parallel_case_with_state(
+        &format!("rwlock_wrapper/parallel_lookup_indices_into_{PARALLEL_THREADS}_threads"),
+        PARALLEL_THREADS,
+        PARALLEL_LOOKUP_ITERS_PER_THREAD,
+        || Vec::with_capacity(128),
+        |worker_id, iter, output| {
+            let prefix_id = (worker_id * 257 + iter) % 4_096;
+            let query = &parallel_queries[prefix_id];
+            black_box(parallel_cache.lookup_indices_into(black_box(&query), black_box(output)));
+            black_box(&output);
+        },
+    );
+
+    time_parallel_case(
+        &format!("rwlock_wrapper/parallel_match_prefix_{PARALLEL_THREADS}_threads"),
+        PARALLEL_THREADS,
+        PARALLEL_MATCH_ITERS_PER_THREAD,
+        |worker_id, iter| {
+            let prefix_id = (worker_id * 257 + iter) % 4_096;
+            let query = &parallel_queries[prefix_id];
+            black_box(parallel_cache.match_prefix(black_box(&query)));
         },
     );
 }
@@ -180,7 +384,7 @@ fn bench_evict() {
         let base_cache = build_linear_cache(num_prefixes, prefix_len, page_size);
         time_case(
             &format!("evict/leaf_lru_prefixes_{num_prefixes}_len_{prefix_len}_page_{page_size}"),
-            BENCH_ITERS,
+            EVICT_BENCH_ITERS,
             || {
                 let mut cache = base_cache.clone();
                 black_box(cache.evict(black_box(evict_size)));
@@ -191,10 +395,13 @@ fn bench_evict() {
 
 fn main() {
     println!("mini-rust-radix-tree benchmark");
-    println!("warmup_iters={WARMUP_ITERS}, bench_iters={BENCH_ITERS}\n");
+    println!(
+        "warmup_iters={WARMUP_ITERS}, bench_iters={BENCH_ITERS}, fast_bench_iters={FAST_BENCH_ITERS}, evict_bench_iters={EVICT_BENCH_ITERS}\n"
+    );
 
     bench_insert();
     bench_match();
+    bench_lookup();
     bench_split();
     bench_lock_unlock();
     bench_concurrent_wrapper();
