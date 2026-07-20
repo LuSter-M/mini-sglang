@@ -1,0 +1,51 @@
+mini-rust-radix-tree mutex baseline
+generated_at: 2026-07-19
+commands:
+  cargo test --manifest-path mini-rust-radix-tree/Cargo.toml
+  cargo bench --manifest-path mini-rust-radix-tree/Cargo.toml --bench radix_cache
+
+===== cargo test =====
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running unittests src/lib.rs (mini-rust-radix-tree/target/debug/deps/mini_rust_radix_tree-9ff74e2ba38fe04e)
+
+running 11 tests
+test tests::concurrent_wrapper_is_send_and_sync ... ok
+test tests::concurrent_wrapper_supports_atomic_multi_step_with_guard ... ok
+test tests::evict_oldest_unprotected_leaf ... ok
+test tests::evict_promotes_unlocked_parent_after_leaf_removed ... ok
+test tests::insert_and_match_full_prefix_page_size_one ... ok
+test tests::insert_splits_partial_node_on_page_boundary ... ok
+test tests::lock_and_unlock_updates_size_info_along_path ... ok
+test tests::locked_handle_cannot_be_evicted ... ok
+test tests::page_size_alignment_drops_tail ... ok
+test tests::reset_clears_cache ... ok
+test tests::concurrent_wrapper_serializes_parallel_inserts ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+   Doc-tests mini_rust_radix_tree
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+===== cargo bench =====
+    Finished `bench` profile [optimized] target(s) in 0.01s
+     Running benches/radix_cache.rs (mini-rust-radix-tree/target/release/deps/radix_cache-30a7210bcf7a37d8)
+mini-rust-radix-tree benchmark
+warmup_iters=100, bench_iters=1000
+
+insert_prefix/cold_len_128_page_1                      total=     0.273 ms  avg=     273.4 ns/op  throughput=   3657604.3 ops/s
+insert_prefix/cold_len_1024_page_1                     total=     0.375 ms  avg=     375.0 ns/op  throughput=   2666901.4 ops/s
+insert_prefix/cold_len_1024_page_16                    total=     0.409 ms  avg=     409.2 ns/op  throughput=   2443613.6 ops/s
+match_prefix/prefixes_1024_len_128_page_1              total=     2.159 ms  avg=     215.9 ns/op  throughput=   4631297.8 ops/s
+match_prefix/prefixes_1024_len_1024_page_1             total=    11.391 ms  avg=    1139.1 ns/op  throughput=    877902.6 ops/s
+match_prefix/prefixes_1024_len_1024_page_16            total=    11.260 ms  avg=    1126.0 ns/op  throughput=    888113.7 ops/s
+split_on_partial_match/mid_node_len_1024_page_1        total=     2.366 ms  avg=    2365.9 ns/op  throughput=    422668.7 ops/s
+lock_unlock_handle/shared_path                         total=     0.122 ms  avg=      12.2 ns/op  throughput=  82238194.7 ops/s
+mutex_wrapper/match_prefix_raw                         total=     2.108 ms  avg=     210.8 ns/op  throughput=   4743995.1 ops/s
+mutex_wrapper/match_prefix_serialized                  total=     2.218 ms  avg=     221.8 ns/op  throughput=   4508330.5 ops/s
+mutex_wrapper/insert_prefix_serialized                 total=     0.329 ms  avg=     329.5 ns/op  throughput=   3035122.4 ops/s
+evict/leaf_lru_prefixes_1024_len_64_page_1             total=   222.126 ms  avg=  222125.7 ns/op  throughput=      4502.0 ops/s
+evict/leaf_lru_prefixes_1024_len_1024_page_16          total=  5401.979 ms  avg= 5401979.0 ns/op  throughput=       185.1 ops/s

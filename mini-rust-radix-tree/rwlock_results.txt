@@ -1,0 +1,75 @@
+mini-rust-radix-tree rwlock read/write Arc span optimized benchmark
+generated_at: 2026-07-20
+commands:
+  cargo fmt --manifest-path mini-rust-radix-tree/Cargo.toml
+  cargo test --manifest-path mini-rust-radix-tree/Cargo.toml
+  cargo bench --manifest-path mini-rust-radix-tree/Cargo.toml --bench radix_cache
+
+===== cargo test =====
+running 18 tests
+test tests::concurrent_wrapper_is_send_and_sync ... ok
+test tests::concurrent_wrapper_supports_atomic_multi_step_with_guard ... ok
+test tests::concurrent_wrapper_lookup_indices_into_reuses_output_buffer ... ok
+test tests::evict_oldest_unprotected_leaf ... ok
+test tests::insert_and_match_full_prefix_page_size_one ... ok
+test tests::evict_promotes_unlocked_parent_after_leaf_removed ... ok
+test tests::lock_and_unlock_updates_size_info_along_path ... ok
+test tests::insert_splits_partial_node_on_page_boundary ... ok
+test tests::locked_handle_cannot_be_evicted ... ok
+test tests::lookup_indices_into_reuses_output_buffer ... ok
+test tests::lookup_prefix_is_read_only_and_does_not_split ... ok
+test tests::lookup_prefix_matches_full_prefix_without_mutation ... ok
+test tests::page_size_alignment_drops_tail ... ok
+test tests::reset_clears_cache ... ok
+test tests::concurrent_wrapper_allows_parallel_read_lookups ... ok
+test tests::concurrent_wrapper_serializes_parallel_inserts ... ok
+test tests::concurrent_wrapper_handles_mixed_reads_writes_and_evictions ... ok
+test tests::concurrent_wrapper_writer_waits_for_read_guard ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+Doc-tests mini_rust_radix_tree
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+===== cargo bench =====
+mini-rust-radix-tree benchmark
+warmup_iters=100, bench_iters=10000, fast_bench_iters=1000000, evict_bench_iters=1000
+
+insert_prefix/cold_len_128_page_1                      total=     3.198 ms  avg=     319.8 ns/op  throughput=   3126958.3 ops/s
+insert_prefix/cold_len_1024_page_1                     total=     4.616 ms  avg=     461.6 ns/op  throughput=   2166181.7 ops/s
+insert_prefix/cold_len_1024_page_16                    total=     4.739 ms  avg=     473.9 ns/op  throughput=   2110262.0 ops/s
+insert_prefix/cold_len_4096_page_16                    total=    17.356 ms  avg=    1735.6 ns/op  throughput=    576182.8 ops/s
+match_prefix/prefixes_1024_len_128_page_1              total=    10.756 ms  avg=     107.6 ns/op  throughput=   9297362.1 ops/s
+match_prefix/prefixes_1024_len_1024_page_1             total=    51.330 ms  avg=     513.3 ns/op  throughput=   1948179.8 ops/s
+match_prefix/prefixes_1024_len_1024_page_16            total=    53.455 ms  avg=     534.6 ns/op  throughput=   1870722.0 ops/s
+match_prefix/prefixes_4096_len_1024_page_16            total=    52.973 ms  avg=     529.7 ns/op  throughput=   1887768.2 ops/s
+match_prefix/prefixes_8192_len_512_page_16             total=    30.162 ms  avg=     301.6 ns/op  throughput=   3315428.7 ops/s
+lookup_indices/prefixes_1024_len_128_page_1            total=    14.567 ms  avg=     145.7 ns/op  throughput=   6864668.4 ops/s
+lookup_indices_into/prefixes_1024_len_128_page_1       total=    12.791 ms  avg=     127.9 ns/op  throughput=   7818222.0 ops/s
+lookup_indices/prefixes_1024_len_1024_page_1           total=    60.084 ms  avg=     600.8 ns/op  throughput=   1664333.3 ops/s
+lookup_indices_into/prefixes_1024_len_1024_page_1      total=    57.922 ms  avg=     579.2 ns/op  throughput=   1726445.5 ops/s
+lookup_indices/prefixes_1024_len_1024_page_16          total=    62.194 ms  avg=     621.9 ns/op  throughput=   1607867.2 ops/s
+lookup_indices_into/prefixes_1024_len_1024_page_16     total=    58.671 ms  avg=     586.7 ns/op  throughput=   1704407.9 ops/s
+lookup_indices/prefixes_4096_len_1024_page_16          total=    62.617 ms  avg=     626.2 ns/op  throughput=   1597005.7 ops/s
+lookup_indices_into/prefixes_4096_len_1024_page_16     total=    58.617 ms  avg=     586.2 ns/op  throughput=   1705995.0 ops/s
+lookup_indices/prefixes_8192_len_512_page_16           total=    35.762 ms  avg=     357.6 ns/op  throughput=   2796282.6 ops/s
+lookup_indices_into/prefixes_8192_len_512_page_16      total=    33.581 ms  avg=     335.8 ns/op  throughput=   2977840.3 ops/s
+split_on_partial_match/mid_node_len_1024_page_1        total=    13.498 ms  avg=    1349.8 ns/op  throughput=    740856.6 ops/s
+lock_unlock_handle/shared_path                         total=     1.098 ms  avg=      11.0 ns/op  throughput=  91053452.0 ops/s
+mutex_wrapper/match_prefix_raw                         total=    10.570 ms  avg=     105.7 ns/op  throughput=   9460667.2 ops/s
+rwlock_wrapper/match_prefix_write_locked               total=   116.358 ms  avg=     116.4 ns/op  throughput=   8594148.2 ops/s
+rwlock_wrapper/lookup_indices_raw                      total=   145.215 ms  avg=     145.2 ns/op  throughput=   6886350.6 ops/s
+rwlock_wrapper/lookup_indices_read_locked              total=   154.026 ms  avg=     154.0 ns/op  throughput=   6492414.8 ops/s
+rwlock_wrapper/lookup_indices_into_raw                 total=   126.297 ms  avg=     126.3 ns/op  throughput=   7917855.9 ops/s
+rwlock_wrapper/lookup_indices_into_read_locked         total=   131.015 ms  avg=     131.0 ns/op  throughput=   7632693.4 ops/s
+rwlock_wrapper/reset_insert_two_write_locks            total=   371.614 ms  avg=     371.6 ns/op  throughput=   2690965.6 ops/s
+rwlock_wrapper/reset_insert_one_write_lock             total=   362.192 ms  avg=     362.2 ns/op  throughput=   2760963.9 ops/s
+rwlock_wrapper/parallel_lookup_indices_8_threads       total=   161.735 ms  avg=     202.2 ns/op  throughput=   4946372.8 ops/s
+rwlock_wrapper/parallel_lookup_indices_into_8_threads  total=   122.300 ms  avg=     152.9 ns/op  throughput=   6541294.8 ops/s
+rwlock_wrapper/parallel_match_prefix_8_threads         total=    82.055 ms  avg=     512.8 ns/op  throughput=   1949920.6 ops/s
+evict/leaf_lru_prefixes_1024_len_64_page_1             total=   146.442 ms  avg=  146441.8 ns/op  throughput=      6828.7 ops/s
+evict/leaf_lru_prefixes_1024_len_1024_page_16          total=   268.319 ms  avg=  268318.7 ns/op  throughput=      3726.9 ops/s
