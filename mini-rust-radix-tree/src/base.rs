@@ -271,6 +271,7 @@ impl PartialOrd for EvictCandidate {
 pub struct RadixPrefixCache {
     page_size: usize,
     nodes: Vec<RadixTreeNode>,
+    evictable_leaf_heap: BinaryHeap<EvictCandidate>,
     evictable_size: usize,
     protected_size: usize,
     next_timestamp: u64,
@@ -285,6 +286,7 @@ impl RadixPrefixCache {
         Self {
             page_size,
             nodes: vec![RadixTreeNode::new_root(0)],
+            evictable_leaf_heap: BinaryHeap::new(),
             evictable_size: 0,
             protected_size: 0,
             next_timestamp: 1,
@@ -417,6 +419,7 @@ impl RadixPrefixCache {
             if self.nodes[node].ref_count == 0 {
                 self.evictable_size += self.nodes[node].len();
                 self.protected_size -= self.nodes[node].len();
+                self.push_evict_candidate_if_leaf(node);
             }
             node = self.nodes[node]
                 .parent
@@ -459,19 +462,17 @@ impl RadixPrefixCache {
             self.evictable_size
         );
 
-        let mut heap = BinaryHeap::new();
-        self.collect_leaf_nodes_for_evict(&mut heap);
-
         let mut evicted_indices = Vec::with_capacity(size);
         let mut evicted_size = 0;
 
         while evicted_size < size {
-            let candidate = heap
+            let candidate = self
+                .evictable_leaf_heap
                 .pop()
                 .expect("Cannot evict enough cache: candidate heap exhausted");
             let node = candidate.node;
 
-            if !self.is_evictable_leaf(node) {
+            if !self.is_fresh_evict_candidate(&candidate) {
                 continue;
             }
 
@@ -486,13 +487,7 @@ impl RadixPrefixCache {
             self.nodes[parent].children.remove(&child_key);
             self.nodes[node].alive = false;
 
-            if self.is_evictable_leaf(parent) {
-                heap.push(EvictCandidate {
-                    timestamp: self.nodes[parent].timestamp,
-                    uuid: self.nodes[parent].uuid,
-                    node: parent,
-                });
-            }
+            self.push_evict_candidate_if_leaf(parent);
         }
 
         evicted_indices
@@ -553,6 +548,7 @@ impl RadixPrefixCache {
             replaced.is_none(),
             "child key collision while inserting radix node"
         );
+        self.push_evict_candidate_if_leaf(node);
         node
     }
 
@@ -586,6 +582,7 @@ impl RadixPrefixCache {
 
             // 完整经过该节点时刷新 timestamp，作为 LRU eviction 的最近访问依据。
             self.nodes[node].timestamp = tic;
+            self.push_evict_candidate_if_leaf(node);
         }
 
         (node, prefix_len)
@@ -659,6 +656,9 @@ impl RadixPrefixCache {
             .children
             .insert(new_child_key, node);
 
+        self.push_evict_candidate_if_leaf(node);
+        self.push_evict_candidate_if_leaf(new_parent_id);
+
         new_parent_id
     }
 
@@ -716,22 +716,20 @@ impl RadixPrefixCache {
             && self.nodes[node].is_leaf()
     }
 
-    /// 收集当前可驱逐的 leaf 节点，并放入按 timestamp 排序的最小堆语义结构。
-    fn collect_leaf_nodes_for_evict(&self, heap: &mut BinaryHeap<EvictCandidate>) {
-        let mut stack = vec![ROOT];
-        while let Some(node) = stack.pop() {
-            if self.is_evictable_leaf(node) {
-                heap.push(EvictCandidate {
-                    timestamp: self.nodes[node].timestamp,
-                    uuid: self.nodes[node].uuid,
-                    node,
-                });
-            } else {
-                for child in self.nodes[node].children.values() {
-                    stack.push(*child);
-                }
-            }
+    fn push_evict_candidate_if_leaf(&mut self, node: NodeId) {
+        if self.is_evictable_leaf(node) {
+            self.evictable_leaf_heap.push(EvictCandidate {
+                timestamp: self.nodes[node].timestamp,
+                uuid: self.nodes[node].uuid,
+                node,
+            });
         }
+    }
+
+    fn is_fresh_evict_candidate(&self, candidate: &EvictCandidate) -> bool {
+        self.is_evictable_leaf(candidate.node)
+            && self.nodes[candidate.node].timestamp == candidate.timestamp
+            && self.nodes[candidate.node].uuid == candidate.uuid
     }
 
     /// 递归校验 radix tree 不变量，用于测试和调试。
