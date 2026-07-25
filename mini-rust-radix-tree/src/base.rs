@@ -1,5 +1,7 @@
+use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 /// Token id / KV cache index 的基础整数类型。
@@ -7,9 +9,61 @@ use std::sync::Arc;
 /// 为了贴近 mini-sglang 里 `torch.int32` token/index tensor 的语义，这里统一用 `i32`。
 pub type Token = i32;
 type NodeId = usize;
-type ChildKey = Vec<Token>;
+
+const INLINE_CHILD_KEY_TOKENS: usize = 16;
 
 const ROOT: NodeId = 0;
+
+#[derive(Debug, Clone)]
+enum ChildKey {
+    Inline {
+        len: usize,
+        data: [Token; INLINE_CHILD_KEY_TOKENS],
+    },
+    Heap(Arc<[Token]>),
+}
+
+impl ChildKey {
+    fn from_slice(tokens: &[Token]) -> Self {
+        if tokens.len() <= INLINE_CHILD_KEY_TOKENS {
+            let mut data = [0; INLINE_CHILD_KEY_TOKENS];
+            data[..tokens.len()].copy_from_slice(tokens);
+            Self::Inline {
+                len: tokens.len(),
+                data,
+            }
+        } else {
+            Self::Heap(Arc::from(tokens))
+        }
+    }
+
+    fn as_slice(&self) -> &[Token] {
+        match self {
+            Self::Inline { len, data } => &data[..*len],
+            Self::Heap(data) => data,
+        }
+    }
+}
+
+impl Borrow<[Token]> for ChildKey {
+    fn borrow(&self) -> &[Token] {
+        self.as_slice()
+    }
+}
+
+impl Hash for ChildKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_slice().hash(state);
+    }
+}
+
+impl PartialEq for ChildKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for ChildKey {}
 
 /// 当前 prefix cache 的容量统计。
 ///
@@ -617,7 +671,7 @@ impl RadixPrefixCache {
     }
 
     fn child_key_owned(&self, tokens: &[Token]) -> ChildKey {
-        self.child_key_slice(tokens).to_vec()
+        ChildKey::from_slice(self.child_key_slice(tokens))
     }
 
     fn append_matched_indices(&self, handle: RadixCacheHandle, output: &mut Vec<Token>) {
@@ -715,7 +769,7 @@ impl RadixPrefixCache {
                 return Err(format!("child {child} parent mismatch"));
             }
             let expected_key = self.child_key_slice(self.nodes[*child].key.as_slice());
-            if key.as_slice() != expected_key {
+            if <ChildKey as Borrow<[Token]>>::borrow(key) != expected_key {
                 return Err(format!("child map key mismatch for child {child}"));
             }
             self.check_node(*child, visited, evictable, protected)?;
@@ -729,8 +783,30 @@ fn align_down(value: usize, alignment: usize) -> usize {
 }
 
 fn common_prefix_len(lhs: &[Token], rhs: &[Token]) -> usize {
-    lhs.iter()
-        .zip(rhs.iter())
-        .take_while(|(a, b)| a == b)
-        .count()
+    let len = lhs.len().min(rhs.len());
+    let lhs = &lhs[..len];
+    let rhs = &rhs[..len];
+
+    let lhs_chunks = lhs.chunks_exact(8);
+    let rhs_chunks = rhs.chunks_exact(8);
+    let remainder = lhs_chunks.remainder();
+
+    let mut matched = 0;
+    for (left, right) in lhs_chunks.zip(rhs_chunks) {
+        if left != right {
+            for i in 0..8 {
+                if left[i] != right[i] {
+                    return matched + i;
+                }
+            }
+        }
+        matched += 8;
+    }
+
+    for (i, (left, right)) in remainder.iter().zip(&rhs[matched..]).enumerate() {
+        if left != right {
+            return matched + i;
+        }
+    }
+    len
 }
